@@ -1,0 +1,6 @@
+{
+  "name": "secret-guard",
+  "version": "0.1.0",
+  "description": "Bloqueia prompts e saídas de ferramentas que contenham chaves/segredos antes de chegarem ao modelo",
+  "author": { "name": "nicolas-fer" }
+}

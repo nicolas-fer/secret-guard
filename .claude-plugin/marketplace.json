@@ -1,0 +1,6 @@
+{
+  "name": "secret-guard",
+  "owner": { "name": "nicolas-fer" },
+  "description": "Marketplace do mod secret-guard para o Claude Code",
+  "plugins": [{ "name": "secret-guard", "source": "./" }]
+}
