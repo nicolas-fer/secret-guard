@@ -193,6 +193,19 @@ export function redact(input: string, isSecretFile = false): Scan {
 
 // --- detect:end
 
+// Respostas de quando um hook falha: nada passa sem verificação.
+const PROMPT_FAILED =
+  'secret-guard: erro ao verificar o prompt, então ele não foi enviado. Tente de novo.'
+const UNVERIFIED = '[REDACTED: secret-guard não conseguiu verificar este conteúdo]'
+
+function maskAll<B extends Block>(content: readonly B[]): B[] {
+  return content.map(b => {
+    if (b.type === 'text') return { ...b, text: UNVERIFIED }
+    if (b.type === 'tool_result') return { ...b, content: UNVERIFIED }
+    return b
+  })
+}
+
 type Block = { type: string; [field: string]: unknown }
 
 function redactBlock(block: Block, hits: string[], secretIds: Set<string>): Block {
@@ -239,12 +252,19 @@ export const register: Register = on => {
     if (hits.length === 0) return next(e)
 
     const kinds = [...new Set(hits)].join(', ')
-    $.ui.toast(`secret-guard: ${hits.length} segredo(s) ocultado(s) do prompt (${kinds})`)
+    try {
+      $.ui.toast(`secret-guard: ${hits.length} segredo(s) ocultado(s) do prompt (${kinds})`)
+    } catch {}
     const note =
       `secret-guard: o usuário colou segredo(s) (${kinds}) que foram trocados por [REDACTED] ` +
       `antes de chegar a você. Não peça o valor; se o código precisar dele, sugira usar uma ` +
       `variável de ambiente ou um arquivo .env.`
     return next({ ...e, text, context: [...(e.context ?? []), note] })
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    // Re-entrada: o hook não rodou e não dá para reescrever, só barrar ou deixar passar.
+    if (next.error.kind === 're-entry') return redact(e.text).hits.length ? { drop: PROMPT_FAILED } : next(e)
+    return { drop: PROMPT_FAILED }
   })
 
   // Marca as chamadas de ferramenta que tocam arquivos de segredos.
@@ -253,6 +273,10 @@ export const register: Register = on => {
       const { tool, tool_use_id, consent, ...args } = e as Record<string, unknown>
       if (SECRET_FILE.test(JSON.stringify(args))) secretFileCalls.add(e.tool_use_id)
     }
+    return next(e)
+  }).catch(($, e, next) => {
+    // Na dúvida, trata a saída da chamada como vinda de um arquivo de segredos.
+    if (e.tool_use_id) secretFileCalls.add(e.tool_use_id)
     return next(e)
   })
 
@@ -270,8 +294,21 @@ export const register: Register = on => {
     if (hits.length === 0) return next(e)
 
     if (e.door === 'tool-result') {
-      $.ui.toast(`secret-guard: ${hits.length} segredo(s) ocultado(s) da saída de uma ferramenta`)
+      try {
+        $.ui.toast(`secret-guard: ${hits.length} segredo(s) ocultado(s) da saída de uma ferramenta`)
+      } catch {}
     }
     return next({ ...e, message: { ...e.message, content } })
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    if (next.error.kind === 're-entry') {
+      if (e.door === 'response') return next(e)
+      const hits: string[] = []
+      e.message.content.forEach(b => redactBlock(b, hits, new Set()))
+      return hits.length ? { deny: 'secret-guard: conteúdo com segredo barrado' } : next(e)
+    }
+    // O filtro falhou: oculta o conteúdo inteiro em vez de deixá-lo passar sem verificação.
+    if (e.door === 'response') return next(e)
+    return next({ ...e, message: { ...e.message, content: maskAll(e.message.content) } })
   })
 }
