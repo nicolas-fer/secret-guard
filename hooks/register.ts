@@ -1,4 +1,4 @@
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 
 // Prefixo que libera um prompt de propósito: "!allow-secret <texto>"
 const BYPASS = '!allow-secret'
@@ -193,6 +193,46 @@ export function redact(input: string, isSecretFile = false): Scan {
 
 // --- detect:end
 
+// --- toggle:start (funções puras do /secret-guard)
+
+// Caminho comparável: barras normais, sem barra no fim, minúsculo (Windows).
+export function normPath(p: string): string {
+  return p.trim().replace(/^["']|["']$/g, '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+}
+
+// A pasta liberada vale para ela e para tudo abaixo dela.
+export function folderMatch(root: string, folders: readonly string[]): string | undefined {
+  const r = normPath(root)
+  return folders.find(f => r === f || r.startsWith(f + '/'))
+}
+
+// "30m", "2h", "1h30m", "45s" ou só um número (minutos) → ms. null se inválido.
+export function parseDuration(s: string): number | null {
+  const t = s.trim().toLowerCase()
+  if (/^\d+$/.test(t)) return Number(t) * 60_000
+  const m = /^(?:(\d+)h)?(?:(\d+)m(?:in)?)?(?:(\d+)s)?$/.exec(t)
+  if (!m || (!m[1] && !m[2] && !m[3])) return null
+  return (Number(m[1] ?? 0) * 60 + Number(m[2] ?? 0)) * 60_000 + Number(m[3] ?? 0) * 1000
+}
+
+export function fmtDuration(ms: number): string {
+  const min = Math.max(1, Math.round(ms / 60_000))
+  return min >= 60 ? `${Math.floor(min / 60)}h${min % 60 ? `${min % 60}min` : ''}` : `${min}min`
+}
+
+// --- toggle:end
+
+const FOLDERS_KEY = 'disabledFolders'
+const HELP = [
+  'Uso do /secret-guard:',
+  '  /secret-guard                   mostra o estado',
+  '  /secret-guard off [30m|2h]      desliga nesta sessão (sem tempo: até você religar ou fechar)',
+  '  /secret-guard on                religa nesta sessão',
+  '  /secret-guard pasta off [path]  desliga sempre nesta pasta (ou na indicada) e subpastas',
+  '  /secret-guard pasta on [path]   volta a proteger a pasta',
+  '  /secret-guard pastas            lista as pastas desligadas',
+].join('\n')
+
 // Respostas de quando um hook falha: nada passa sem verificação.
 const PROMPT_FAILED =
   'secret-guard: erro ao verificar o prompt, então ele não foi enviado. Tente de novo.'
@@ -237,13 +277,150 @@ function redactBlock(block: Block, hits: string[], secretIds: Set<string>): Bloc
   return block
 }
 
+type Toggle = {
+  // undefined = ligado, Infinity = até religar, número = desligado até esse instante.
+  pausedUntil?: number
+  // Pastas desligadas (cópia em memória do $.store, normalizadas).
+  folders: string[]
+}
+
+async function loadFolders($: EngineInterface, t: Toggle): Promise<void> {
+  const v = await $.store.get(FOLDERS_KEY)
+  t.folders = Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []
+}
+
+async function refreshStatus($: EngineInterface, t: Toggle): Promise<void> {
+  try {
+    const off = t.pausedUntil !== undefined || folderMatch(await $.session.root(), t.folders) !== undefined
+    $.ui.status(off ? 'SECRET-GUARD OFF' : undefined)
+  } catch {}
+}
+
+// Motivo de estar desligado agora, ou undefined se o filtro deve rodar.
+// Qualquer erro aqui deixa o filtro LIGADO.
+async function offReason($: EngineInterface, t: Toggle): Promise<string | undefined> {
+  try {
+    if (t.pausedUntil !== undefined) {
+      if (t.pausedUntil === Infinity) return 'desligado nesta sessão'
+      const left = t.pausedUntil - (await $.clock.now())
+      if (left > 0) return `desligado por mais ${fmtDuration(left)}`
+      t.pausedUntil = undefined
+      try {
+        $.ui.toast('secret-guard: pausa terminou, proteção religada')
+      } catch {}
+      await refreshStatus($, t)
+    }
+    const f = folderMatch(await $.session.root(), t.folders)
+    return f ? `desligado na pasta ${f}` : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export const register: Register = on => {
   let allowNextPrompt = false
   // tool_use_ids de chamadas que leram um arquivo de segredos (.env etc.)
   const secretFileCalls = new Set<string>()
 
+  // Estado do /secret-guard nesta sessão.
+  const t: Toggle = { folders: [] }
+
+  on('session.start', async ($, e, next) => {
+    try {
+      await loadFolders($, t)
+      await $.command.register({
+        name: 'secret-guard',
+        description: 'Liga/desliga o secret-guard nesta sessão (off [30m]) ou numa pasta (pasta off). Sem argumento mostra o estado',
+        argumentHint: '[on|off [tempo]|pasta on|pasta off [path]|pastas]',
+        immediate: true,
+      })
+      await refreshStatus($, t)
+    } catch {}
+    return next(e)
+  })
+
+  on('command.run', async ($, e, next) => {
+    if (e.command !== 'secret-guard') return next(e)
+    // Só o usuário (Enter no prompt ou Remote Control) pode mexer; o modelo e outros plugins não.
+    if (e.origin.kind !== 'composer' && e.origin.kind !== 'bridge') {
+      return { text: 'secret-guard: só o usuário pode ligar/desligar a proteção.' }
+    }
+
+    const [cmd = '', sub = '', ...rest] = e.args.trim().split(/\s+/).filter(Boolean)
+    const action = cmd.toLowerCase()
+
+    if (action === 'off' || action === 'desligar') {
+      if (sub) {
+        const ms = parseDuration(sub)
+        if (ms === null || ms <= 0) return { text: `secret-guard: tempo inválido "${sub}". Ex.: 30m, 2h, 1h30m.` }
+        t.pausedUntil = (await $.clock.now()) + ms
+      } else {
+        t.pausedUntil = Infinity
+      }
+      await refreshStatus($, t)
+      const quando = sub ? `por ${fmtDuration(t.pausedUntil - (await $.clock.now()))}` : 'até "/secret-guard on" ou o fim da sessão'
+      return {
+        text: `secret-guard desligado ${quando}. Prompts e saídas de ferramentas não serão filtrados.`,
+        context: ['O usuário desligou o secret-guard temporariamente; segredos não serão mais ocultados até ele religar. Não repita segredos desnecessariamente.'],
+      }
+    }
+
+    if (action === 'on' || action === 'ligar') {
+      t.pausedUntil = undefined
+      await refreshStatus($, t)
+      const f = folderMatch(await $.session.root(), t.folders)
+      return {
+        text: f
+          ? `Pausa removida, mas a pasta ${f} continua desligada. Use "/secret-guard pasta on" para protegê-la.`
+          : 'secret-guard ligado.',
+      }
+    }
+
+    if (action === 'pasta' || action === 'folder') {
+      const mode = sub.toLowerCase()
+      const target = normPath(rest.length ? rest.join(' ') : await $.session.root())
+      if (!target) return { text: HELP }
+      await loadFolders($, t)
+      if (mode === 'off' || mode === 'desligar') {
+        if (!t.folders.includes(target)) t.folders = [...t.folders, target]
+        await $.store.set(FOLDERS_KEY, t.folders)
+        await refreshStatus($, t)
+        return { text: `secret-guard desligado sempre em ${target} (e subpastas). "/secret-guard pasta on" desfaz.` }
+      }
+      if (mode === 'on' || mode === 'ligar') {
+        const before = t.folders.length
+        t.folders = t.folders.filter(f => f !== target)
+        await $.store.set(FOLDERS_KEY, t.folders)
+        await refreshStatus($, t)
+        const parent = folderMatch(target, t.folders)
+        if (before === t.folders.length) {
+          return {
+            text: parent
+              ? `${target} não estava na lista, mas está dentro de ${parent}, que está desligada.`
+              : `${target} já estava protegida.`,
+          }
+        }
+        return { text: `secret-guard volta a proteger ${target}.` }
+      }
+      return { text: HELP }
+    }
+
+    if (action === 'pastas' || action === 'folders' || action === 'list') {
+      await loadFolders($, t)
+      return { text: t.folders.length ? `Pastas sem secret-guard:\n${t.folders.map(f => `  ${f}`).join('\n')}` : 'Nenhuma pasta desligada.' }
+    }
+
+    if (action && action !== 'status') return { text: HELP }
+    const why = await offReason($, t)
+    return { text: `secret-guard: ${why ?? 'ligado'}.\n\n${HELP}` }
+  }).catch(($, e, next) => {
+    if (next.called || e.command !== 'secret-guard') return next(e)
+    return { text: 'secret-guard: erro ao executar o comando; nada foi alterado.' }
+  })
+
   // Camada 1: o prompt digitado. Troca o segredo por [REDACTED...] e envia o resto.
-  on('prompt.submit', ($, e, next) => {
+  on('prompt.submit', async ($, e, next) => {
+    if (await offReason($, t)) return next(e)
     if (e.text.trimStart().startsWith(BYPASS)) {
       allowNextPrompt = true
       return next({ ...e, text: e.text.trimStart().slice(BYPASS.length).trimStart() })
@@ -282,8 +459,9 @@ export const register: Register = on => {
 
   // Camada 2: tudo o que entra na conversa (resultados de ferramentas, MCP,
   // subagentes, contexto injetado). Troca só o segredo por [REDACTED...].
-  on('session.append', ($, e, next) => {
+  on('session.append', async ($, e, next) => {
     if (e.door === 'response') return next(e)
+    if (await offReason($, t)) return next(e)
     if (e.door === 'prompt' && allowNextPrompt) {
       allowNextPrompt = false
       return next(e)

@@ -25,6 +25,29 @@ claude plugin update secret-guard
 
 Depois, `/reload-plugins` numa sessão aberta.
 
+## Ligar e desligar
+
+| Comando | O que faz |
+| --- | --- |
+| `/secret-guard` | Mostra o estado e as opções |
+| `/secret-guard off [30m\|2h\|1h30m]` | Desliga nesta sessão; sem tempo, até religar ou fechar a sessão |
+| `/secret-guard on` | Religa nesta sessão |
+| `/secret-guard pasta off [path]` | Desliga sempre nesta pasta (ou na indicada) e nas subpastas |
+| `/secret-guard pasta on [path]` | Volta a proteger a pasta |
+| `/secret-guard pastas` | Lista as pastas desligadas |
+
+Só o usuário pode ligar ou desligar: o comando recusa chamadas do modelo e de outros plugins. Desligado, a barra de status mostra `SECRET-GUARD OFF`. Qualquer erro ao checar o estado deixa a proteção ligada, e uma pausa termina se a sessão reiniciar.
+
 ## Exceções
 
 Valores que nunca devem ser tratados como segredo vão no `ALLOWLIST` em `hooks/register.ts`.
+
+## Limitações
+
+A detecção é por padrões e heurísticas: um segredo num formato desconhecido (senha curta, token de sistema interno, chave sem nome de variável) pode passar. Trate o mod como rede de segurança, não como motivo para colar segredos. Se um vazar, rotacione.
+
+## Testes
+
+```
+claude plugin test .
+```
